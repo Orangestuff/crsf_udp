@@ -12,6 +12,11 @@
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
 #include <lwip/netdb.h>
+#include "esp_http_server.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "html.h"
+#include "crc.h"
 
 static const char *TAG = "ETH_CRSF_BRIDGE";
 
@@ -24,79 +29,109 @@ static const char *TAG = "ETH_CRSF_BRIDGE";
 #define ETH_MDIO_GPIO        18
 
 // ---------------------------------------------------------
-// CRSF & Network Configuration
+// CRSF Configuration
 // ---------------------------------------------------------
-#define TARGET_IP_ADDR      "192.168.88.251" // The IP receiving the CRSF telemetry
-#define TARGET_UDP_PORT     8888
-
 #define CRSF_UART_PORT      UART_NUM_2
-#define CRSF_RX_PIN         5   // Safe WT32-ETH01 header pin
-#define CRSF_DUMMY_TX_PIN   4   // Routed to a harmless pin to prevent default overlap
+#define CRSF_RX_PIN         5   
+#define CRSF_DUMMY_TX_PIN   4   
 #define UART_BUF_SIZE       1024
 
 // ---------------------------------------------------------
-// CRSF Parser Variables & Tables
+// Global Configuration Variables
 // ---------------------------------------------------------
-uint16_t rc_channels[16];
+char target_ip[16] = "192.168.1.100"; // Default fallback IP
+int target_port = 8888;               // Default fallback Port
 
-static const uint8_t crc8tab[256] = {
-    0x00, 0xD5, 0x7F, 0xAA, 0xFE, 0x2B, 0x81, 0x54, 0x29, 0xFC, 0x56, 0x83, 0xD7, 0x02, 0xA8, 0x7D,
-    0x52, 0x87, 0x2D, 0xF8, 0xAC, 0x79, 0xD3, 0x06, 0x7B, 0xAE, 0x04, 0xD1, 0x85, 0x50, 0xFA, 0x2F,
-    0xA4, 0x71, 0xDB, 0x0E, 0x5A, 0x8F, 0x25, 0xF0, 0x8D, 0x58, 0xF2, 0x27, 0x73, 0xA6, 0x0C, 0xD9,
-    0xF6, 0x23, 0x89, 0x5C, 0x08, 0xDD, 0x77, 0xA2, 0xDF, 0x0A, 0xA0, 0x75, 0x21, 0xF4, 0x5E, 0x8B,
-    0x9D, 0x48, 0xE2, 0x37, 0x63, 0xB6, 0x1C, 0xC9, 0xB4, 0x61, 0xCB, 0x1E, 0x4A, 0x9F, 0x35, 0xE0,
-    0xCF, 0x1A, 0xB0, 0x65, 0x31, 0xE4, 0x4E, 0x9B, 0xE6, 0x33, 0x99, 0x4C, 0x18, 0xCD, 0x67, 0xB2,
-    0x39, 0xEC, 0x46, 0x93, 0xC7, 0x12, 0xB8, 0x6D, 0x10, 0xC5, 0x6F, 0xBA, 0xEE, 0x3B, 0x91, 0x44,
-    0x6B, 0xBE, 0x14, 0xC1, 0x95, 0x40, 0xEA, 0x3F, 0x42, 0x97, 0x3D, 0xE8, 0xBC, 0x69, 0xC3, 0x16,
-    0xEF, 0x3A, 0x90, 0x45, 0x11, 0xC4, 0x6E, 0xBB, 0xC6, 0x13, 0xB9, 0x6C, 0x38, 0xED, 0x47, 0x92,
-    0xBD, 0x68, 0xC2, 0x17, 0x43, 0x96, 0x3C, 0xE9, 0x94, 0x41, 0xEB, 0x3E, 0x6A, 0xBF, 0x15, 0xC0,
-    0x4B, 0x9E, 0x34, 0xE1, 0xB5, 0x60, 0xCA, 0x1F, 0x62, 0xB7, 0x1D, 0xC8, 0x9C, 0x49, 0xE3, 0x36,
-    0x19, 0xCC, 0x66, 0xB3, 0xE7, 0x32, 0x98, 0x4D, 0x30, 0xE5, 0x4F, 0x9A, 0xCE, 0x1B, 0xB1, 0x64,
-    0x72, 0xA7, 0x0D, 0xD8, 0x8C, 0x59, 0xF3, 0x26, 0x5B, 0x8E, 0x24, 0xF1, 0xA5, 0x70, 0xDA, 0x0F,
-    0x20, 0xF5, 0x5F, 0x8A, 0xDE, 0x0B, 0xA1, 0x74, 0x09, 0xDC, 0x76, 0xA3, 0xF7, 0x22, 0x88, 0x5D,
-    0xD6, 0x03, 0xA9, 0x7C, 0x28, 0xFD, 0x57, 0x82, 0xFF, 0x2A, 0x80, 0x55, 0x01, 0xD4, 0x7E, 0xAB,
-    0x84, 0x51, 0xFB, 0x2E, 0x7A, 0xAF, 0x05, 0xD0, 0xAD, 0x78, 0xD2, 0x07, 0x53, 0x86, 0x2C, 0xF9
-};
-
-uint8_t crsf_crc8(const uint8_t *ptr, uint8_t len) {
-    uint8_t crc = 0;
-    for (uint8_t i = 0; i < len; i++) {
-        crc = crc8tab[crc ^ *ptr++];
+// ---------------------------------------------------------
+// NVS Helper Functions
+// ---------------------------------------------------------
+void load_config_from_nvs() {
+    nvs_handle_t my_handle;
+    esp_err_t err = nvs_open("storage", NVS_READWRITE, &my_handle);
+    if (err == ESP_OK) {
+        size_t required_size = sizeof(target_ip);
+        nvs_get_str(my_handle, "ip", target_ip, &required_size);
+        nvs_get_i32(my_handle, "port", (int32_t*)&target_port);
+        nvs_close(my_handle);
+        printf("Loaded Config from NVS -> IP: %s, Port: %d\n", target_ip, target_port);
     }
-    return crc;
 }
 
-void unpack_crsf_channels(const uint8_t* p) {
-    rc_channels[0] = ((p[1] & 0x07) << 8) | p[0];
-    rc_channels[1] = ((p[2] & 0x3F) << 5) | (p[1] >> 3);
-    rc_channels[2] = ((p[4] & 0x01) << 10) | (p[3] << 2) | (p[2] >> 6);
-    rc_channels[3] = ((p[5] & 0x0F) << 7) | (p[4] >> 1);
-    rc_channels[4] = ((p[6] & 0x7F) << 4) | (p[5] >> 4);
+void save_config_to_nvs(const char* ip, int port) {
+    nvs_handle_t my_handle;
+    esp_err_t err = nvs_open("storage", NVS_READWRITE, &my_handle);
+    if (err == ESP_OK) {
+        nvs_set_str(my_handle, "ip", ip);
+        nvs_set_i32(my_handle, "port", port);
+        nvs_commit(my_handle);
+        nvs_close(my_handle);
+        printf("Saved Config to NVS -> IP: %s, Port: %d\n", ip, port);
+    }
 }
 
-void process_crsf_packet(uint8_t *frame) {
-    uint8_t frame_type = frame[2];
-    
-    if (frame_type == 0x16) { 
-        unpack_crsf_channels(&frame[3]);
+// ---------------------------------------------------------
+// HTTP Server Handlers
+// ---------------------------------------------------------
+static esp_err_t index_get_handler(httpd_req_t *req) {
+    char response[2048];
+    snprintf(response, sizeof(response), html_template, target_ip, target_port);
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t config_post_handler(httpd_req_t *req) {
+    char buf[100];
+    int ret, remaining = req->content_len;
+
+    if (remaining >= sizeof(buf)) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    ret = httpd_req_recv(req, buf, remaining);
+    if (ret <= 0) {
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char new_ip[16] = {0};
+    char new_port_str[10] = {0};
+
+    // Parse the form data
+    if (httpd_query_key_value(buf, "ip", new_ip, sizeof(new_ip)) == ESP_OK &&
+        httpd_query_key_value(buf, "port", new_port_str, sizeof(new_port_str)) == ESP_OK) {
         
-        static TickType_t last_print = 0;
-        TickType_t now = xTaskGetTickCount();
-        /*
-        if (now - last_print >= pdMS_TO_TICKS(100)) {
-            
-            // Print the first 4 channels to the console for debugging
-            printf("Roll: %04d | Pitch: %04d | Thr: %04d | Yaw: %04d\n", 
-                     rc_channels[0], rc_channels[1], rc_channels[2], rc_channels[3]);
-                     
-            last_print = now;
-        }
-            */
+        // Update Globals
+        strncpy(target_ip, new_ip, sizeof(target_ip) - 1);
+        target_port = atoi(new_port_str);
+        
+        // Save to Flash
+        save_config_to_nvs(target_ip, target_port);
+    }
+
+    // Redirect back to the main page to show updated values
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+void start_webserver() {
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t uri_get = { .uri = "/", .method = HTTP_GET, .handler = index_get_handler, .user_ctx = NULL };
+        httpd_uri_t uri_post = { .uri = "/config", .method = HTTP_POST, .handler = config_post_handler, .user_ctx = NULL };
+        
+        httpd_register_uri_handler(server, &uri_get);
+        httpd_register_uri_handler(server, &uri_post);
+        printf("Web Server Started Successfully.\n");
     }
 }
 
 // ---------------------------------------------------------
-// Bridge Task (UDP Sending + Parsing Loop)
+// The Bridge Task (UDP Sending + Parsing Loop)
 // ---------------------------------------------------------
 void crsf_rx_udp_task(void *arg) {
     
@@ -108,11 +143,8 @@ void crsf_rx_udp_task(void *arg) {
     }
 
     struct sockaddr_in dest_addr;
-    dest_addr.sin_addr.s_addr = inet_addr(TARGET_IP_ADDR);
     dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(TARGET_UDP_PORT);
-    
-    printf("UDP Socket bound. Target: %s:%d\n", TARGET_IP_ADDR, TARGET_UDP_PORT);
+
     printf("CRSF Sliding Window Parser Started on RX Pin %d\n", CRSF_RX_PIN);
 
     uint8_t window[256];
@@ -120,8 +152,13 @@ void crsf_rx_udp_task(void *arg) {
     uint8_t uart_data[128];
 
     while (1) {
+        // Read data from UART
         int rx_bytes = uart_read_bytes(CRSF_UART_PORT, uart_data, sizeof(uart_data), 10 / portTICK_PERIOD_MS);
         
+        // Dynamically update the target address from our globals before sending
+        dest_addr.sin_addr.s_addr = inet_addr(target_ip);
+        dest_addr.sin_port = htons(target_port);
+
         if (rx_bytes > 0) {
             for (int i = 0; i < rx_bytes; i++) {
                 if (window_len < sizeof(window)) {
@@ -145,7 +182,6 @@ void crsf_rx_udp_task(void *arg) {
                 }
                 
                 uint8_t total_frame_size = frame_len + 2; 
-                
                 if (window_len < total_frame_size) {
                     break; 
                 }
@@ -154,19 +190,14 @@ void crsf_rx_udp_task(void *arg) {
                 uint8_t received_crc = window[total_frame_size - 1];
                 
                 if (calculated_crc == received_crc) {
-                    // VALID FRAME DETECTED
                     process_crsf_packet(window);
                     
-                    int err = sendto(sock, window, total_frame_size, 0, 
-                                     (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-                    if (err < 0) {
-                        printf("UDP Send Error: errno %d\n", errno);
-                    }
+                    // Send to the dynamically configured IP and Port
+                    sendto(sock, window, total_frame_size, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
                     
                     memmove(window, window + total_frame_size, window_len - total_frame_size);
                     window_len -= total_frame_size;
                 } else {
-                    // CRC Failed
                     memmove(window, window + 1, window_len - 1);
                     window_len--;
                 }
@@ -178,36 +209,34 @@ void crsf_rx_udp_task(void *arg) {
 // ---------------------------------------------------------
 // Ethernet Event Handlers
 // ---------------------------------------------------------
-static void eth_event_handler(void *arg, esp_event_base_t event_base,
-                              int32_t event_id, void *event_data)
-{
+static void eth_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     uint8_t mac_addr[6] = {0};
     esp_eth_handle_t eth_handle = *(esp_eth_handle_t *)event_data;
-
     switch (event_id) {
-    case ETHERNET_EVENT_CONNECTED:
-        esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR, mac_addr);
-        printf("Ethernet Link Up\n");
-        break;
-    case ETHERNET_EVENT_DISCONNECTED:
-        printf("Ethernet Link Down\n");
-        break;
-    default:
-        break;
+        case ETHERNET_EVENT_CONNECTED:
+            esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR, mac_addr);
+            printf("Ethernet Link Up\n");
+            break;
+        case ETHERNET_EVENT_DISCONNECTED:
+            printf("Ethernet Link Down\n");
+            break;
+        default:
+            break;
     }
 }
 
-static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
-                                 int32_t event_id, void *event_data)
-{
+static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     const esp_netif_ip_info_t *ip_info = &event->ip_info;
 
     printf("\nSUCCESS: Network Connection Established!\n");
     printf("========================================\n");
     printf("Assigned IP:  " IPSTR "\n", IP2STR(&ip_info->ip));
+    printf("Target UDP IP: %s:%d\n", target_ip, target_port);
     printf("========================================\n\n");
 
+    // Launch tasks only after we have an IP
+    start_webserver();
     xTaskCreate(crsf_rx_udp_task, "crsf_rx_udp", 4096, NULL, 10, NULL);
 }
 
@@ -216,7 +245,18 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
 // ---------------------------------------------------------
 void app_main(void)
 {
-    // --- Initialize UART
+    // --- 1. Initialize NVS (Non-Volatile Storage) ---
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+
+    // --- 2. Load Configured IP/Port ---
+    load_config_from_nvs();
+
+    // --- 3. Initialize UART ---
     uart_config_t uart_config = {
         .baud_rate = 400000,
         .data_bits = UART_DATA_8_BITS,
@@ -231,7 +271,7 @@ void app_main(void)
     ESP_ERROR_CHECK(uart_set_pin(CRSF_UART_PORT, CRSF_DUMMY_TX_PIN, CRSF_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     ESP_ERROR_CHECK(uart_set_line_inverse(CRSF_UART_PORT, UART_SIGNAL_RXD_INV));
 
-    // --- Initialize Network ---
+    // --- 4. Initialize Network ---
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
