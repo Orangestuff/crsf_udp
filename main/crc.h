@@ -49,7 +49,7 @@ void process_crsf_packet(uint8_t *frame) {
     
     if (frame_type == 0x16) { 
         unpack_crsf_channels(&frame[3]);
-        
+        /*
         static TickType_t last_print = 0;
         TickType_t now = xTaskGetTickCount();
         
@@ -58,5 +58,7 @@ void process_crsf_packet(uint8_t *frame) {
                      rc_channels[0], rc_channels[1], rc_channels[2], rc_channels[3]);
             last_print = now;
         }
+        */
     }
+        
 }
